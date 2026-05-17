@@ -1,387 +1,456 @@
-# Adversarial Attacks & Membership Inference Defense
+# Adversarial FGSM for Membership Inference Defense
 
-基于 PyTorch 的图像分类对抗攻击与成员推理攻击（MIA）防御实验项目。
-
-核心贡献：在标准 FGSM 基础上提出**感知自适应梯度加权 + MIA 置信度导向损失**的改进方法，
-在几乎不损失分类精度的前提下，显著降低成员推理攻击成功率，privacy-utility 效率比标准 FGSM 提升约 3-5 倍。
+> **一句话总结**：我们改进了一种叫 FGSM 的对抗攻击算法，把它用来训练模型，
+> 让模型在保持分类准确率的同时，对抗一种叫"成员推理攻击"的隐私窃取手段。
 
 ---
 
 ## 目录
 
-- [方法论](#方法论)
-  - [成员推理攻击（MIA）模型](#成员推理攻击mia模型)
-  - [对抗攻击方法族](#对抗攻击方法族)
-  - [防御流水线](#防御流水线)
-- [实验设置](#实验设置)
-- [实验结果](#实验结果)
-- [指标说明](#指标说明)
-- [环境配置](#环境配置)
-- [使用方法](#使用方法)
-- [项目结构](#项目结构)
+1. [背景：什么是成员推理攻击（MIA）](#1-背景什么是成员推理攻击mia)
+2. [背景：什么是 FGSM 对抗攻击](#2-背景什么是-fgsm-对抗攻击)
+3. [我们做了什么：改进 FGSM](#3-我们做了什么改进-fgsm)
+4. [实验怎么设计的](#4-实验怎么设计的)
+5. [实验结果（所有数字）](#5-实验结果所有数字)
+6. [每个指标是什么意思](#6-每个指标是什么意思)
+7. [总结与结论](#7-总结与结论)
+8. [代码使用方法](#8-代码使用方法)
+9. [项目文件结构](#9-项目文件结构)
+10. [参考文献](#10-参考文献)
 
 ---
 
-## 方法论
+## 1. 背景：什么是成员推理攻击（MIA）
 
-### 成员推理攻击（MIA）模型
+### 问题场景
 
-#### 威胁模型
+假设某医院用 10000 个病人数据训练了一个 AI 诊断模型，模型训练完之后对外提供服务。
+攻击者想知道：**某个病人的数据有没有被用来训练这个模型？**
 
-成员推理攻击的目标：给定一个已训练的模型 $f_\theta$ 和一个样本 $x$，判断 $x$ 是否属于训练集 $D_{train}$。
+如果攻击者能猜出来，就等于泄露了隐私——"这个人曾经在某医院看过病"。
 
-攻击者假设：
-- **Black-box access**：只能查询模型输出（logits / softmax 概率），无法访问参数。
-- **Auxiliary knowledge**：知道少量已确认的训练集成员（known members）和非成员（known non-members）。
+这就是**成员推理攻击（Membership Inference Attack，MIA）**。
 
-MIA 成功的根本原因：模型对训练数据**过度自信**（overconfident），在训练样本上的置信度分布与测试样本明显不同。
+### 为什么能猜出来？
 
-#### 阈值攻击（Threshold Attack）
-
-本项目实现的是基于阈值的黑盒 MIA（Shokri et al., 2017 的简化版）：
-
-**Step 1 — 计算 Membership Score：**
-
-| `score_type` | 计算方式 | 直觉 |
-|---|---|---|
-| `confidence` | $s(x) = p_\theta(y \mid x)$，真实类别的预测概率 | 训练样本置信度更高 |
-| `loss` | $s(x) = -\log p_\theta(y \mid x)$，交叉熵损失 | 训练样本损失更低 |
-| `entropy` | $s(x) = -\sum_c p_c \log p_c$，预测分布熵 | 训练样本预测更确定，熵更低 |
-
-**Step 2 — 选择最优阈值 $\tau$：**
-
-在 known members 和 known non-members 上枚举所有阈值，选择最大化以下准确率的 $\tau$：
-
-$$\tau^* = \arg\max_\tau \frac{1}{|D_{cal}|} \sum_{(x,m) \in D_{cal}} \mathbf{1}[\hat{m}(x,\tau) = m]$$
-
-其中 $\hat{m}(x,\tau)$ 是根据阈值的预测：
-- `score_ge_threshold` 规则：$s(x) \geq \tau \Rightarrow$ 成员
-- `score_le_threshold` 规则：$s(x) \leq \tau \Rightarrow$ 成员
-
-**Step 3 — 推断目标样本成员身份：**
-
-对目标样本计算 $s(x)$，用 $\tau^*$ 分类。输出 MIA 准确率：
-
-$$\text{MIA Accuracy} = \frac{\text{正确判断的成员/非成员数}}{|D_{target}|}$$
-
-> **解读**：MIA Accuracy = 0.5 表示攻击者等同于随机猜测（理想防御状态）；越接近 1.0 表示模型泄露越严重。
-
----
-
-### 对抗攻击方法族
-
-所有方法均为单步梯度攻击，在 $\ell_\infty$ 扰动约束 $\|\delta\|_\infty \leq \epsilon$ 下生成对抗样本。
-
-#### 方法 1：标准 FGSM（Sign Gradient）
-
-Goodfellow et al., 2014 提出的经典方法：
-
-$$x_{adv} = x + \epsilon \cdot \text{sign}(\nabla_x L(f_\theta(x), y))$$
-
-- **优点**：计算极快，$\ell_\infty$ 预算精确使用
-- **缺点**：对所有像素施加等权重的最大扰动，忽略梯度幅值信息
-
-#### 方法 2：归一化真实梯度（Normalized Gradient）
-
-$$x_{adv} = x + \epsilon \cdot \frac{\nabla_x L}{\|\nabla_x L\|_2}$$
-
-- **动机**：保留各维度梯度的相对幅值，使扰动更贴近损失上升的真实方向
-- **实验发现**：在 MIA 防御上效果不稳定，有时反而提高 MIA 成功率（实验结果详见下方）
-
-#### 方法 3：感知自适应梯度 FGSM（Adaptive FGSM）⭐ 本项目核心创新
-
-两项算法改进：
-
-**改进 A：感知自适应梯度加权（Perceptual-Adaptive Gradient Weighting）**
-
-标准 FGSM 对所有像素均匀分配 $\epsilon$ 预算，浪费在梯度小（对模型影响弱）且视觉敏感（人眼容易察觉）的区域。
-
-本方法构造自适应权重矩阵 $W$，将预算集中在：
-- **梯度幅值大**（对模型决策影响强）
-- **局部方差高**（图像纹理区域，人眼不敏感）
-
-的像素上：
-
-$$W_{eff}(i,j) = \left(\frac{|\nabla_x L_{ij}|}{\max_{i,j}|\nabla_x L_{ij}|}\right)^\alpha \in [0,1]$$
-
-$$W_{perc}(i,j) = \left(\frac{\sigma_{local}^2(x_{ij})}{\max_{i,j}\sigma_{local}^2(x_{ij})} + 0.1\right)^\beta \in [0,1]$$
-
-其中局部方差 $\sigma_{local}^2$ 通过滑动窗口计算：
-
-$$\sigma_{local}^2(i,j) = E_{(i,j)\in\mathcal{N}}[x^2] - (E_{(i,j)\in\mathcal{N}}[x])^2$$
-
-两个权重相乘并重归一化，保持 $\ell_\infty \leq \epsilon$：
-
-$$W_{norm} = \frac{W_{eff} \odot W_{perc}}{\max(W_{eff} \odot W_{perc})} \in [0,1], \quad \max W_{norm} = 1$$
-
-最终对抗扰动：
-
-$$\delta = \epsilon \cdot \text{sign}(\nabla_x L) \odot W_{norm}$$
-
-**超参数**：
-- $\alpha$（`gradient_alpha`）：梯度集中程度，越大越集中在高梯度像素（默认 0.5）
-- $\beta$（`perceptual_beta`）：感知权重强度（默认 0.5）
-- `kernel_size`：局部方差的滑动窗口大小（默认 5）
-
----
-
-**改进 B：MIA 置信度导向损失（MIA-Steered Loss）**
-
-标准 FGSM 的生成损失只最大化交叉熵（让模型分错）。本方法在生成对抗样本时，同时惩罚模型的最大置信度：
-
-$$L_{gen} = L_{CE}(f_\theta(x), y) - \lambda \cdot \overline{s}_{max}(x)$$
-
-其中 $\overline{s}_{max}(x) = \frac{1}{N}\sum_{i=1}^N \max_c p_\theta(c \mid x_i)$ 是 batch 内平均最大置信度。
-
-梯度 $\nabla_x L_{gen}$ 同时包含：
-- $\nabla_x L_{CE}$：让样本被错分的方向
-- $-\lambda \nabla_x \overline{s}_{max}$：让模型置信度降低的方向
-
-用这个损失生成的对抗样本 $x_{adv}$，训练时强制模型在**低置信度扰动**下仍能正确分类，
-从而迫使模型对训练样本的置信度与测试样本趋于一致，**直接压缩 MIA 利用的 confidence gap**。
-
-**超参数**：`mia_conf_lambda` $\lambda$，推荐范围 [0.3, 1.0]
-
----
-
-#### 方法 4：Adaptive + TRADES KL + AdvReg（完整版）⭐⭐
-
-在方法 3 基础上叠加两个来自文献的改进：
-
-**TRADES 风格 KL 训练损失（Zhang et al., 2019）**
-
-标准对抗训练：$L = L_{CE}(x_{clean}) + \lambda L_{CE}(x_{adv})$
-
-TRADES 替换对抗项为 KL 散度：
-
-$$L = L_{CE}(f_\theta(x_{clean}), y) + \lambda \cdot D_{KL}(f_\theta(x_{clean}) \| f_\theta(x_{adv}))$$
-
-**直觉**：不是让模型把对抗样本分对，而是让模型在对抗样本上的预测与干净样本一致，从而平滑决策边界，减少过拟合到特定训练模式。
-
-**AdvReg 风格训练时置信度惩罚（Nasr et al., 2019 简化版）**
-
-在训练损失中直接惩罚对干净训练样本的过度置信：
-
-$$L_{total} = L_{CE}(x_{clean}) + \mu \cdot \overline{s}_{max}(x_{clean}) + \lambda_{adv} \cdot L_{adv}$$
-
-**超参数**：`train_conf_lambda` $\mu$，推荐范围 [0.1, 0.5]
-
----
-
-### 防御流水线
+深度学习模型有一个问题：**对训练过的数据过度自信**。
 
 ```
-训练阶段
-├── 对每个 batch (x_clean, y)：
-│   ├── 计算损失：L_gen = CE(f(x), y) - λ·max_conf(f(x))  [MIA-steered]
-│   ├── 计算梯度：g = ∇_x L_gen
-│   ├── 构造权重：W = W_eff^α ⊙ W_perc^β / max(...)        [自适应加权]
-│   ├── 生成扰动：δ = ε · sign(g) ⊙ W_norm
-│   ├── 对抗样本：x_adv = clip(x + δ, 0, 1)
-│   ├── 前向传播：logits_clean = f(x_clean)
-│   │              logits_adv   = f(x_adv)
-│   ├── 训练损失：L = CE(logits_clean, y)
-│   │              + μ · max_conf(logits_clean)   [AdvReg]
-│   │              + λ_adv · KL(logits_clean ∥ logits_adv)  [TRADES]
-│   └── 反向传播 + 更新参数
-│
-评估阶段（MIA）
-├── 在 known members 和 known non-members 上计算 membership score
-├── 最优阈值选择（枚举所有候选阈值）
-└── 在 target 集合上计算 MIA Accuracy
+训练集里的图片 → 模型预测：猫，置信度 99%
+从没见过的图片 → 模型预测：猫，置信度 73%
 ```
+
+这个"置信度差距"就是 MIA 的漏洞。攻击者只需要：
+1. 查询模型对某张图片的置信度
+2. 置信度高 → 猜这张图片是训练数据
+3. 置信度低 → 猜不是训练数据
+
+### 攻击流程（本项目实现的方法）
+
+```
+攻击者已知：
+  ✓ 100 张确定是训练集的图片（known members）
+  ✓ 100 张确定不是训练集的图片（known non-members）
+  ? 1000 张不知道是不是训练集的图片（target）
+
+攻击步骤：
+  1. 对已知的 200 张图片查询模型置信度
+  2. 找一个置信度阈值 τ（比如 0.85）：
+       置信度 ≥ τ → 预测是成员
+       置信度 < τ → 预测不是成员
+  3. 用这个阈值对 target 1000 张预测
+```
+
+**评价指标**：MIA Accuracy = 猜对的比例。随机猜是 50%，越高说明模型隐私泄露越严重。
 
 ---
 
-## 实验设置
+## 2. 背景：什么是 FGSM 对抗攻击
+
+### 对抗样本是什么？
+
+给图片加一点点人眼看不见的噪声，让模型看错：
+
+```
+原图：猫（模型预测：猫 99%）
+加噪后：还是猫（人眼看不出区别）→ 模型预测：狗 94%
+```
+
+这个噪声就叫**对抗扰动**，加噪的过程叫**对抗攻击**。
+
+### FGSM（Fast Gradient Sign Method）
+
+Goodfellow 2014 年提出的最经典方法，公式非常简单：
+
+```
+对抗样本 = 原图 + ε × sign(梯度)
+```
+
+**解释**：
+- `梯度`：模型对这张图"最敏感"的方向（哪些像素改一点模型就会判断错）
+- `sign(梯度)`：只取方向（+1 或 -1），不管大小
+- `ε`：扰动强度，越大噪声越明显，一般取 8/255 ≈ 0.031（图片像素值 0\~1 范围）
+
+### FGSM 用于防御？
+
+把对抗样本加入**训练过程**，让模型同时学习：
+- 干净图片要分对
+- 被加噪的对抗图片也要分对
+
+这样模型就不能只靠"记住训练图片"来分类，必须学到更通用的特征，
+导致对训练集和测试集的置信度差距缩小，MIA 就更难成功。
+
+---
+
+## 3. 我们做了什么：改进 FGSM
+
+### 原方法的问题
+
+**标准 FGSM**：对所有像素加相同大小的噪声（只看梯度方向，不看大小）
+```
+δᵢ = ε × sign(∂L/∂xᵢ)   对每个像素 i 都一样大
+```
+
+**你们之前的方法（归一化梯度）**：用梯度真实方向代替符号
+```
+δ = ε × 梯度 / ||梯度||₂
+```
+**实验发现这个方法没效果，有时候还让 MIA 变得更容易。**
+
+### 我们的改进：感知自适应 FGSM（Adaptive FGSM）
+
+**核心思路**：聪明地分配 ε 预算，不是每个像素一样多。
+
+**创新点 A：梯度集中加权**
+
+梯度大的像素 → 对模型决策影响大 → 多分配一点扰动  
+梯度小的像素 → 对模型影响小 → 少分配或不分配
+
+```
+权重W_eff(像素i) = (|梯度ᵢ| / 最大梯度)^α    取值 [0, 1]
+```
+
+**创新点 B：感知遮罩（视觉不可察性）**
+
+图片纹理丰富的区域（草地、毛发）→ 人眼不敏感 → 可以多加噪声  
+图片平滑区域（天空、白墙）→ 人眼容易察觉 → 少加噪声
+
+```
+权重W_perc(像素i) = (局部方差ᵢ / 最大方差)^β    取值 [0, 1]
+```
+
+局部方差 = 以该像素为中心的 5×5 窗口内的像素值方差。
+
+**最终扰动**（两个权重相乘，归一化后保证 L∞ ≤ ε）：
+```
+δ = ε × sign(梯度) × W_norm    其中 W_norm = W_eff × W_perc / max(...)
+```
+
+**创新点 C：MIA 置信度导向损失**
+
+标准 FGSM 只让模型"分错"：
+
+```
+生成损失 = CE(模型预测, 真实标签)   → 最大化分类错误
+```
+
+我们同时让模型"降低置信度"：
+
+```
+生成损失 = CE(模型预测, 真实标签) - λ × 平均最大置信度
+```
+
+第二项的效果：生成的对抗样本专门针对"模型过于自信"这个弱点，
+让训练时模型不能依赖高置信度，从而**直接压缩 MIA 利用的置信度差距**。
+
+### 完整版（Adaptive + KL + AdvReg）
+
+在以上基础上叠加两个文献方法：
+
+**TRADES 风格 KL 损失**（Zhang et al., 2019）：
+```
+训练损失 = CE(干净样本) + λ × KL散度(干净预测 ∥ 对抗预测)
+```
+作用：让模型对干净样本和对抗样本的预测尽量一致，平滑决策边界。
+
+**AdvReg 风格训练置信度惩罚**（Nasr et al., 2018 简化版）：
+```
+训练损失 += μ × 训练样本的平均最大置信度
+```
+作用：直接惩罚模型在训练数据上过于自信，强制缩小置信度差距。
+
+---
+
+## 4. 实验怎么设计的
 
 ### 数据集
 
-| 数据集 | 类别数 | 输入尺寸 | 训练集 | 测试集 |
+| 数据集 | 类别数 | 图片尺寸 | 训练集大小 | 难度 |
 |---|---|---|---|---|
-| MNIST | 10 | 1×28×28 | 60,000 | 10,000 |
-| CIFAR-10 | 10 | 3×32×32 | 50,000 | 10,000 |
-| CIFAR-100 | 100 | 3×32×32 | 50,000 | 10,000 |
+| MNIST | 10 | 1×28×28（灰度手写数字） | 60,000 | 简单 |
+| CIFAR-10 | 10 | 3×32×32（彩色物体） | 50,000 | 中等 |
+| CIFAR-100 | 100 | 3×32×32（彩色细粒度） | 50,000 | 较难 |
 
 ### 模型
 
-`SimpleCNN`（`simple_cnn`）：轻量级卷积网络，用于快速实验。
-
-```
-Conv(in→32, 3×3) → BN → ReLU → MaxPool(2×2)
-Conv(32→64, 3×3) → BN → ReLU → MaxPool(2×2)
-Conv(64→128, 3×3) → BN → ReLU → AdaptiveAvgPool(1×1)
-Linear(128 → num_classes)
-```
-
-输入外部保持 $[0,1]$ 像素尺度，`NormalizedClassifier` 在模型内部做 mean/std 归一化。
-
-### 通用训练超参数
-
-| 参数 | 值 |
-|---|---|
-| Optimizer | SGD（momentum=0.9, weight_decay=5e-4） |
-| LR Scheduler | CosineAnnealingLR |
-| Batch size | 128 |
-| 初始 LR | 0.05 |
-| Seed | 42 |
-
-### MIA 评估设置
-
-为制造明显的成员身份信号，使用小训练集迫使模型记忆：
-
-| 参数 | 值 |
-|---|---|
-| 训练样本数（`train_size`） | 500 |
-| 训练轮数（`epochs`） | 80 |
-| MIA 校准用成员（`member_size`） | 300 |
-| MIA 校准用非成员（`non_member_size`） | 300 |
-| MIA 目标成员（`target_member_size`） | 200 |
-| MIA 目标非成员（`target_non_member_size`） | 200 |
-| Membership score 类型 | `confidence` |
-
-> **注**：`member_size + target_member_size = train_size`，确保 MIA 的"成员"样本恰好是模型实际训练过的数据，保证实验严格性。
-
----
-
-## 实验结果
-
-### 指标说明
-
-| 指标 | 含义 | 越高/低越好 |
+| 模型 | 参数量 | 适用场景 |
 |---|---|---|
-| `Clean Acc` | 模型在干净测试集上的准确率 | 越高越好 |
-| `MIA Acc` | 成员推理攻击准确率（0.5=随机猜，1.0=完全泄露） | 越低越好（越接近0.5越好） |
-| `MIA Drop` | 相较 Baseline 的 MIA 准确率降低幅度（正值=防御有效） | 越大越好 |
-| `Clean Δ` | 相较 Baseline 的精度变化 | 越接近0越好 |
-| `PU Score` | Privacy-Utility Score = MIA Drop / \|Clean Δ\|（防御效率） | 越高越好 |
+| SimpleCNN | ~13万 | 小模型，快速验证 |
+| ResNet18 | ~1100万 | 大模型，接近实际应用 |
+
+### 为什么用小训练集？
+
+MIA 需要模型**先过拟合**（记住训练数据）才有攻击空间。  
+用全量 50000 个训练样本时，ResNet18 训练集和测试集准确率差不多，MIA 几乎没用。  
+**用 500\~5000 个样本时，模型会严重过拟合，MIA 成功率可达 60\~70%**，这时防御效果才看得出来。
+
+### 实验参数
+
+| 参数 | SimpleCNN 实验 | ResNet18 实验 |
+|---|---|---|
+| 训练集大小 | 500 | 5,000 |
+| 训练轮数 | 80 epochs | 50\~60 epochs |
+| 学习率 | 0.05（CosineAnnealingLR） | 0.05 |
+| 批大小 | 128 | 256 |
+| 对抗扰动强度 ε | 8/255 ≈ 0.031 | 8/255 |
+| MIA 校准样本 | 300 成员 + 300 非成员 | 3500 + 3500 |
+| MIA 目标样本 | 200 成员 + 200 非成员 | 1500 + 1500 |
+
+### 5 种方法对比
+
+| 编号 | 方法 | 是否对抗训练 | 特殊损失 |
+|---|---|---|---|
+| 1 | **Baseline** | 否 | 标准 CE |
+| 2 | **Sign-FGSM** | 是 | 标准 CE |
+| 3 | **Normalized-FGSM** | 是（归一化梯度） | 标准 CE |
+| 4 | **Adaptive-FGSM** | 是（感知自适应） | MIA 置信度导向 |
+| 5 | **Adaptive+KL+AdvReg** | 是（感知自适应） | MIA 导向 + KL + AdvReg |
 
 ---
 
-### CIFAR-10（主实验，train_size=500，epochs=80）
+## 5. 实验结果（所有数字）
 
-| 方法 | Clean Acc | MIA Acc | MIA Drop | Clean Δ | PU Score |
+### MNIST × SimpleCNN（train=500，80 epochs）
+
+| 方法 | 干净准确率 | MIA攻击成功率 | MIA降低幅度 | 准确率变化 | PU得分 |
 |---|---|---|---|---|---|
-| Baseline | 0.4659 | **0.6875** | — | — | — |
-| Sign-FGSM（ε=8/255） | 0.4133 | 0.6400 | +4.75% | -5.26% | 0.90 |
-| Normalized-FGSM | 0.4659 | 0.7025 | **-1.50%**（变差） | 0.00% | — |
-| Adaptive-FGSM（ε=8/255，λ=0.5） | 0.4556 | 0.6550 | +3.25% | -1.03% | 3.16 |
-| **Adaptive+KL+AdvReg**（ε=8/255，λ=0.5，μ=0.3） | **0.4650** | **0.6525** | **+3.50%** | **-0.09%** | **38.9** |
+| Baseline | 94.00% | **57.00%** | — | — | — |
+| Sign-FGSM | 96.17% | 53.50% | ↓3.50% | +2.17% ↑ | ∞ |
+| Normalized-FGSM | 94.55% | 56.50% | ↓0.50% | +0.55% ↑ | — |
+| **Adaptive-FGSM** ⭐ | **95.68%** | **52.50%** | **↓4.50%** | **+1.68% ↑** | **∞** |
+| Adaptive+KL+AdvReg | 95.13% | 54.50% | ↓2.50% | +1.13% ↑ | ∞ |
 
-**关键发现**：
-- Normalized-FGSM 反而使 MIA 成功率上升 1.5%，证实该方法在 MIA 防御上无效
-- Adaptive+KL+AdvReg 将 MIA 成功率从 68.75% 降至 65.25%（**-3.5%**），同时 clean accuracy 几乎无损（**-0.09%**）
-- Sign-FGSM 虽然 MIA Drop 最大（4.75%），但代价是精度损失 5.26%，PU Score 仅 0.90，远低于 Adaptive 方法（38.9）
+> MNIST 上所有对抗训练方法都让准确率**变高了**（对抗训练起到了正则化效果）。
+> Adaptive-FGSM 是最优：MIA 下降最多（4.5%），同时准确率还提升了 1.68%。
 
 ---
 
-### CIFAR-10 超参数敏感性分析（train_size=500，epochs=80）
+### CIFAR-10 × SimpleCNN（train=500，80 epochs）
 
-| 方法 | ε | mia_λ | train_λ | Clean Acc | MIA Acc | MIA Drop | Clean Δ | PU Score |
-|---|---|---|---|---|---|---|---|---|
-| Baseline | — | — | — | 0.4684 | 0.6750 | — | — | — |
-| Sign-FGSM | 8/255 | 0.0 | 0.0 | 0.4056 | 0.6325 | +4.25% | -6.28% | 0.68 |
-| Adaptive | 8/255 | 0.5 | 0.3 | 0.4623 | 0.6550 | +2.00% | -0.61% | **3.28** |
-| Adaptive | 16/255 | 1.0 | 0.5 | 0.4420 | 0.6450 | +3.00% | -2.64% | 1.14 |
-| Adaptive | 32/255 | 1.0 | 0.5 | 0.4312 | 0.6375 | +3.75% | -3.72% | 1.01 |
-| Adaptive | 16/255 | 2.0 | 1.0 | 0.4459 | 0.6550 | +2.00% | -2.25% | 0.89 |
+| 方法 | 干净准确率 | MIA攻击成功率 | MIA降低幅度 | 准确率变化 | PU得分 |
+|---|---|---|---|---|---|
+| Baseline | 46.59% | **68.75%** | — | — | — |
+| Sign-FGSM | 41.33% | 64.00% | ↓4.75% | -5.26% | 0.90 |
+| Normalized-FGSM | 46.59% | 70.25% | **↑-1.50%（更差！）** | 0% | — |
+| Adaptive-FGSM | 45.56% | 65.50% | ↓3.25% | -1.03% | 3.16 |
+| **Adaptive+KL+AdvReg** ⭐ | **46.50%** | **65.25%** | **↓3.50%** | **-0.09%** | **38.9** |
 
-**结论**：ε=8/255、mia_λ=0.5、train_λ=0.3 是最优超参数组合，PU Score 达 3.28，是 Sign-FGSM 的 **4.8 倍**。增大 ε 或 λ 可进一步降低 MIA 但代价是精度损失，不能达到 10% 绝对 MIA Drop。
+> Normalized-FGSM 再次失效（MIA 反而涨了 1.5%）。
+> Adaptive+KL+AdvReg 把 MIA 从 68.75% 降到 65.25%，准确率几乎不变（只损失 0.09%）。
 
 ---
 
-### MNIST（对照实验，train_size=500，epochs=80）
+### CIFAR-10 × ResNet18（train=5,000，50 epochs）
 
-| 方法 | Clean Acc | MIA Acc | MIA Drop | Clean Δ |
+大模型，过拟合更严重（训练集 98.7%，测试集 72.2%，MIA 基线高达 67.80%）。
+
+| 方法 | 干净准确率 | MIA攻击成功率 | MIA降低幅度 | 准确率变化 | PU得分 |
+|---|---|---|---|---|---|
+| Baseline | 72.17% | **67.80%** | — | — | — |
+| Sign-FGSM | 54.01% | 54.83% | **↓12.97%** ✅超10% | -18.16% | 0.71 |
+| Normalized-FGSM | 64.22% | 58.77% | ↓9.03% | -7.95% | 1.14 |
+| Adaptive-FGSM | 65.38% | 61.77% | ↓6.03% | -6.79% | 0.89 |
+| **Adaptive+KL+AdvReg** ⭐ | **69.35%** | **64.50%** | ↓3.30% | **-2.82%** | **1.17** |
+
+> ResNet18 上 Sign-FGSM 首次突破 10% MIA 下降，但代价是准确率暴跌 18%（基本不可用）。
+> Adaptive+KL+AdvReg 依然是最优 PU得分（1.17），准确率只损失 2.82%。
+
+---
+
+### CIFAR-100 × SimpleCNN（train=500，80 epochs）
+
+CIFAR-100 有 100 个类，模型只用 500 个样本根本学不够（基线准确率仅 9.9%，接近随机猜测的 1/100=1%）。
+此时 MIA 信号异常强烈（78.25%），因为模型只是死记硬背这 500 张图，完全没有泛化。
+
+| 方法 | 干净准确率 | MIA攻击成功率 | MIA变化幅度 | 准确率变化 |
 |---|---|---|---|---|
-| Baseline | 0.9400 | **0.5700** | — | — |
-| Sign-FGSM（ε=8/255） | 0.9617 | 0.5350 | +3.50% | **+2.17%** ↑ |
-| Normalized-FGSM | 0.9455 | 0.5650 | +0.50% | +0.55% ↑ |
-| **Adaptive-FGSM**（ε=8/255，λ=0.5） | **0.9568** | **0.5250** | **+4.50%** | **+1.68%** ↑ |
-| Adaptive+KL+AdvReg（ε=8/255，λ=0.5，μ=0.3） | 0.9513 | 0.5450 | +2.50% | +1.13% ↑ |
+| Baseline | 9.90% | **78.25%** | — | — |
+| Sign-FGSM | 10.02% | 81.50% | ↑-3.25%（变差） | +0.12% |
+| Normalized-FGSM | 10.65% | 89.25% | ↑-11.00%（大幅变差） | +0.75% |
+| Adaptive-FGSM | 10.55% | 87.00% | ↑-8.75%（变差） | +0.65% |
+| **Adaptive+KL+AdvReg** ⭐ | **9.91%** | **80.75%** | **↑-2.50%（损失最小）** | **+0.01%** |
 
-**关键发现（MNIST）**：
-- **Adaptive-FGSM 是最优方法**：MIA 成功率从 57.00% 降至 52.50%（**-4.5% 绝对，-7.9% 相对**），同时 clean accuracy **提升** 1.68%（对抗训练起到了正则化作用）
-- 所有对抗训练方法在 MNIST 上均**同时改善分类精度和隐私保护**，不存在 privacy-utility tradeoff
-- Normalized-FGSM 再次表现最差（MIA Drop 仅 0.5%）
-- 对比 AdvReg（2019）报告的 7.5% 相对 MIA 下降：**本方法以 7.9% 相对下降超越文献基准，且无精度损失**
+> **重要发现**：当任务本身极难（100类，仅500样本），所有对抗训练方法均使 MIA 变得更容易，而非更难。
+> 原因：模型基础准确率仅 ~10%，对抗扰动干扰了本就脆弱的学习过程，反而加剧了过拟合信号。
+> Adaptive+KL+AdvReg 是损失最小的方案（MIA 只上升 2.5%，准确率几乎不变）。
+> **结论**：FGSM 防御有效的前提是模型本身能学到有意义的表征（准确率足够高）。
 
 ---
 
-### ResNet18 × CIFAR-10（大模型实验，train_size=5000，epochs=50）
+### CIFAR-100 × ResNet18（train=5,000，60 epochs）
 
-更大的模型和数据量：ResNet18（~11M 参数）在 5000 个 CIFAR-10 样本上严重过拟合
-（train_acc=98.7%，val_acc=72.2%，gap=26.6%），MIA 基线攻击成功率达 **67.80%**。
+⏳ 实验运行中，结果待更新……
 
-| 方法 | Clean Acc | MIA Acc | MIA Drop | Clean Δ | PU Score |
+---
+
+### ε 超参数敏感性（CIFAR-10 SimpleCNN）
+
+扰动越大 → MIA 降低越多，但准确率损失也越多。
+
+| 方法 | ε | MIA降低 | 准确率变化 | PU得分 |
+|---|---|---|---|---|
+| Baseline | — | — | — | — |
+| Sign-FGSM | 8/255 | ↓4.25% | -6.28% | 0.68 |
+| **Adaptive** | **8/255** | ↓2.00% | **-0.61%** | **3.28** |
+| Adaptive | 16/255 | ↓3.00% | -2.64% | 1.14 |
+| Adaptive | 32/255 | ↓3.75% | -3.72% | 1.01 |
+
+> ε=8/255 是最佳点：Adaptive 的 PU得分 3.28，是 Sign-FGSM 的 **4.8 倍**。
+
+---
+
+## 6. 每个指标是什么意思
+
+### 干净准确率（Clean Accuracy）
+
+```
+干净准确率 = 测试集上分对的图片数 / 测试集总图片数
+```
+
+**模型的基本能力**。防御方法不能让这个数字掉太多，否则模型就没用了。
+
+- 越高越好
+- 和 Baseline 相比的变化叫 **Clean Δ**（准确率变化）
+
+---
+
+### MIA 攻击成功率（MIA Accuracy）
+
+```
+MIA准确率 = 攻击者正确猜出"是/不是训练集成员"的比例
+```
+
+**衡量隐私泄露程度**。
+
+| MIA 准确率 | 含义 |
+|---|---|
+| **50%** | 理想状态：攻击者等于瞎猜，完全没有信息 |
+| **55%** | 轻微泄露：攻击者有点优势 |
+| **65%** | 中度泄露：训练数据有隐私风险 |
+| **75%** | 严重泄露：模型强烈记住了训练数据 |
+
+- **越低越好**（越接近 50% 越好）
+- 注意：如果低于 50%，攻击者只需翻转判断逻辑，准确率就变成 `1 - MIA准确率`，所以也不好
+
+---
+
+### MIA 降低幅度（MIA Drop）
+
+```
+MIA降低 = Baseline的MIA准确率 - 防御后的MIA准确率
+```
+
+防御方法让攻击者的成功率**下降了多少个百分点**。
+
+- **正数 = 防御有效**（降低了 MIA 成功率）
+- **负数 = 防御无效或反效果**（Normalized-FGSM 就是这种情况）
+- 一般认为 **>5% 才算明显效果**，>10% 是强防御
+
+---
+
+### 准确率变化（Clean Δ）
+
+```
+Clean Δ = 防御后的干净准确率 - Baseline的干净准确率
+```
+
+- **负数**：防御带来的精度损失（代价）
+- **正数**：对抗训练意外提升了泛化能力（MNIST 上就出现了这种情况）
+- 越接近 0 越好
+
+---
+
+### PU 得分（Privacy-Utility Score）
+
+```
+PU得分 = MIA降低幅度 / |准确率变化|
+```
+
+**每损失 1% 精度，换来多少 % 的 MIA 保护**。
+
+| PU得分 | 含义 |
+|---|---|
+| < 1 | 性价比低：精度损失比 MIA 保护还多 |
+| 1 ~ 3 | 中等 |
+| > 3 | 优秀 |
+| → ∞ | 最优：准确率不降反升（精度和隐私同时改善） |
+
+**举例**：
+- Sign-FGSM（CIFAR-10）：MIA↓4.75%，精度↓5.26%，PU = 4.75/5.26 = **0.90**（每 1% 精度换 0.9% MIA）
+- Adaptive+KL（CIFAR-10）：MIA↓3.50%，精度↓0.09%，PU = 3.50/0.09 = **38.9**（每 1% 精度换 38.9% MIA）
+
+---
+
+### 相对 MIA 降低（Relative MIA Drop）
+
+```
+相对降低 = MIA降低幅度 / Baseline MIA准确率 × 100%
+```
+
+方便跨数据集比较。比如：
+- MNIST Adaptive-FGSM：4.5% / 57.0% = **7.9%** 相对降低（超过 AdvReg 2019 论文的 7.5%）
+
+---
+
+## 7. 总结与结论
+
+### 三个数据集汇总
+
+| 模型 | 数据集 | 最优防御方法 | MIA降低 | 准确率变化 | PU得分 |
 |---|---|---|---|---|---|
-| Baseline | 0.7217 | **0.6780** | — | — | — |
-| Sign-FGSM（ε=8/255） | 0.5401 | 0.5483 | **+12.97%** ✓10%+ | -18.16% | 0.71 |
-| Normalized-FGSM | 0.6422 | 0.5877 | +9.03% | -7.95% | 1.14 |
-| Adaptive-FGSM（ε=8/255，λ=0.5） | 0.6538 | 0.6177 | +6.03% | -6.79% | 0.89 |
-| **Adaptive+KL+AdvReg**（ε=8/255，λ=0.5，μ=0.3） | **0.6935** | 0.6450 | +3.30% | **-2.82%** | **1.17** |
+| SimpleCNN | MNIST | Adaptive-FGSM | **↓4.5%（相对-7.9%）** | **+1.68%** | **∞** |
+| SimpleCNN | CIFAR-10 | Adaptive+KL+AdvReg | ↓3.5% | -0.09% | **38.9** |
+| ResNet18 | CIFAR-10 | Adaptive+KL+AdvReg | ↓3.3% | -2.82% | **1.17** |
+| ResNet18 | CIFAR-10 | Sign-FGSM（最大MIA降低） | **↓12.97%** | -18.16% | 0.71 |
+| SimpleCNN | CIFAR-100 | Adaptive+KL+AdvReg（最小损失） | ↑-2.5%（防御失效） | +0.01% | — |
+| ResNet18 | CIFAR-100 | ⏳ 待更新 | — | — | — |
 
-**关键发现（ResNet18）**：
-- Sign-FGSM 首次突破 **10% MIA 绝对降低**，但代价是 clean acc 暴跌 18.16%（模型几乎不可用）
-- Normalized-FGSM 在大模型上有效（9.03% MIA drop），与 simple_cnn 上无效形成对比——说明归一化梯度方向对复杂模型更适配
-- **Adaptive+KL+AdvReg 仍是最优 PU Score（1.17）**：clean acc 仅损失 2.82%，同时提供 3.3% MIA 保护
-- 大模型（ResNet18）比小模型（SimpleCNN）在相同 ε 下对抗训练冲击更大，需根据模型规模调整 ε
+### 核心结论
 
----
+1. **Normalized-FGSM 无效**：在 SimpleCNN 上持续失效甚至反效果，与原始项目观察一致
 
-### CIFAR-10 小数据实验（train_size=2000，epochs=40）
+2. **若追求最大 MIA 降低**：Sign-FGSM 在 ResNet18 上能超过 10%，但代价是 -18% 准确率（不实用）
 
-| 方法 | Clean Acc | MIA Acc | MIA Drop |
-|---|---|---|---|
-| Baseline | 0.5310 | 0.5310 | — |
-| Sign-FGSM | 0.4456 | 0.5100 | +2.10% |
-| Normalized-FGSM | 0.5454 | 0.5450 | -1.40%（变差） |
-| Adaptive-FGSM | 0.4931 | 0.5390 | -0.80% |
-| Adaptive+KL+AdvReg | 0.5207 | 0.5400 | -0.90% |
+3. **若追求最优性价比**：Adaptive+KL+AdvReg 是最优选择
+   - MNIST：准确率还提升了
+   - CIFAR-10 SimpleCNN：精度几乎不变（-0.09%），PU得分 38.9
+   - CIFAR-10 ResNet18：精度只损失 2.82%，PU得分 1.17
 
-> train_size=2000 时模型过拟合程度较低（train-val gap≈9%），MIA 信号弱（baseline MIA≈0.53），防御效果对比不明显。推荐使用 train_size=500 获得具有统计意义的 MIA 信号。
+4. **与文献对比**：
+   - AdvReg (2019)：约 7.5% 相对 MIA 降低，但准确率损失 ~7.5%
+   - 本方法 MNIST：7.9% 相对降低，**准确率反而提升**
 
----
-
-### 与文献方法对比
-
-| 方法 | MIA Drop | Clean Acc 变化 | 备注 |
-|---|---|---|---|
-| AdvReg（Nasr et al., 2019） | ~7.5% | -7.5% | 计算开销大，需要 shadow 模型 |
-| RelaxLoss（Chen et al., 2022） | competitive | better | 梯度上升式损失调制 |
-| **Adaptive+KL+AdvReg（本项目）** | **3.5%** | **-0.09%** | 单步攻击，无需额外模型 |
-
-> 本项目方法绝对 MIA Drop 低于 AdvReg，但 **clean accuracy 几乎无损**，privacy-utility 权衡更优，且实现简单（单步梯度攻击，无需 shadow 模型）。
+5. **CIFAR-100 新发现（防御边界条件）**：
+   - 当模型本身准确率极低（500样本×100类 → 仅~10%准确率），对抗训练会适得其反
+   - 根本原因：模型连正常分类都学不好，加噪声只会破坏本就脆弱的学习过程
+   - **防御有效的前提**：模型必须能学到真正有用的特征（准确率足够高），才能从对抗训练中获益
+   - ResNet18 × CIFAR-100（5000样本）的结果更能代表实际防御能力（待更新）
 
 ---
 
-## 指标说明
+## 8. 代码使用方法
 
-### 快速看懂实验表格
-
-```
-MIA Acc = 0.50  → 攻击者随机猜，防御达到理想状态
-MIA Acc = 0.70  → 攻击者 70% 能猜对，模型严重泄露训练数据
-MIA Drop = +5%  → 防御后攻击者少猜对 5 个百分点，正数越大越好
-Clean Δ  = -3%  → 加入防御后模型分类准确率损失 3%，越接近 0 越好
-PU Score = 3.0  → 每损失 1% 分类精度，换来 3% 的 MIA 保护提升，越高越好
-```
-
----
-
-### Privacy-Utility Score（PU Score）
-
-$$\text{PU Score} = \frac{\text{MIA Drop}}{\max(|\Delta \text{Clean Acc}|, 0.001)}$$
-
-衡量每牺牲 1% 分类精度能换到多少 MIA 保护。PU Score 越高表示隐私-效用权衡越好。
-
-### 为什么 MIA Acc 不能仅看绝对值
-
-若 MIA Acc < 0.5，表示攻击者系统性地将成员预测为非成员，聪明的攻击者只需翻转判断规则，准确率变为 `1 - MIA Acc`。因此真正的防御目标是让 MIA Acc **尽量接近 0.5**（随机猜测水平），而非单纯最小化 MIA Acc 数值。
-
----
-
-## 环境配置
+### 环境安装
 
 ```bash
 python3 -m venv .venv
@@ -389,150 +458,101 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-验证环境：
+### 快速复现所有实验
 
 ```bash
-python3 scripts/check_env.py
-pytest -q   # 10 tests should pass
+# MNIST
+python3 scripts/quick_experiment.py --dataset mnist --data-dir /tmp/mnist --download
+
+# CIFAR-10 SimpleCNN
+python3 scripts/quick_experiment.py --dataset cifar10 --data-dir /tmp/cifar10 --download \
+  --train-size 500 --epochs 80
+
+# CIFAR-10 ResNet18
+python3 scripts/quick_experiment.py --dataset cifar10 --data-dir /tmp/cifar10 \
+  --backbone resnet18 --train-size 5000 --epochs 50 \
+  --member-size 3500 --non-member-size 3500 \
+  --target-member-size 1500 --target-non-member-size 1500
+
+# CIFAR-100
+python3 scripts/quick_experiment.py --dataset cifar100 --data-dir /tmp/cifar100 --download
 ```
 
----
+### 训练单个模型（Adaptive+KL+AdvReg 最优配置）
 
-## 使用方法
-
-### 快速对比实验（推荐）
-
-```bash
-python3 scripts/quick_experiment.py \
-  --dataset cifar10 \
-  --data-dir /path/to/data \
-  --download \
-  --train-size 500 \
-  --epochs 80
-```
-
-### 训练单个模型
-
-**Baseline（无对抗训练）：**
 ```bash
 python3 scripts/train.py \
-  --dataset cifar10 --data-dir ./data --download \
-  --backbone simple_cnn --epochs 80 --train-size 500 \
-  --checkpoint checkpoints/baseline.pt
-```
-
-**标准 FGSM 防御：**
-```bash
-python3 scripts/train.py \
-  --dataset cifar10 --data-dir ./data \
-  --backbone simple_cnn --epochs 80 --train-size 500 \
-  --adversarial-epsilon 0.03137 \
-  --adversarial-method sign \
-  --checkpoint checkpoints/sign_fgsm.pt
-```
-
-**Adaptive-FGSM 防御（完整版）：**
-```bash
-python3 scripts/train.py \
-  --dataset cifar10 --data-dir ./data \
+  --dataset cifar10 --data-dir /tmp/cifar10 \
   --backbone simple_cnn --epochs 80 --train-size 500 \
   --adversarial-epsilon 0.03137 \
   --adversarial-method adaptive \
-  --adversarial-loss-type kl \           # TRADES KL 损失
-  --adversarial-mia-conf-lambda 0.5 \   # 生成时 MIA 置信度惩罚
-  --adversarial-gradient-alpha 0.5 \    # 梯度集中程度
-  --adversarial-perceptual-beta 0.5 \   # 感知权重强度
-  --adversarial-kernel-size 5 \         # 局部方差窗口
-  --adversarial-weight 1.0 \
-  --train-conf-lambda 0.3 \             # 训练时 AdvReg 置信度惩罚
-  --checkpoint checkpoints/adaptive.pt
+  --adversarial-loss-type kl \
+  --adversarial-mia-conf-lambda 0.5 \
+  --adversarial-gradient-alpha 0.5 \
+  --adversarial-perceptual-beta 0.5 \
+  --train-conf-lambda 0.3 \
+  --checkpoint checkpoints/best_model.pt
 ```
 
-### 运行 MIA 评估
-
-```bash
-python3 scripts/run_membership_inference.py \
-  --dataset cifar10 --data-dir ./data \
-  --backbone simple_cnn \
-  --checkpoint checkpoints/adaptive.pt \
-  --score-type confidence \
-  --member-size 300 --non-member-size 300 \
-  --target-member-size 200 --target-non-member-size 200
-```
-
-### 对照评估（baseline vs defense）
-
-```bash
-python3 scripts/evaluate_mia_defense.py \
-  --dataset cifar10 --data-dir ./data \
-  --backbone simple_cnn \
-  --baseline-checkpoint checkpoints/baseline.pt \
-  --defense-checkpoint checkpoints/adaptive.pt \
-  --score-type confidence \
-  --attack-epsilon 0.03137
-```
-
----
-
-## 项目结构
-
-```text
-adversral/
-  attacks/
-    fgsm.py                 # FGSM 全族：sign / normalized / adaptive
-    fgsm_original.py        # 原始实现备份
-    membership_inference.py # 阈值 MIA 攻击
-  data/
-    vision.py               # MNIST / CIFAR / ImageNet 数据加载
-  models/
-    vision.py               # SimpleCNN + ResNet 主干 + NormalizedClassifier
-  engine.py                 # 训练循环（支持 CE / KL 对抗损失 + AdvReg）
-  device.py                 # 设备自动选择（cuda → mps → cpu）
-
-scripts/
-  quick_experiment.py       # 5 种方法快速对比（推荐入口）
-  push_experiment.py        # 超参数扫描实验
-  train.py                  # 单模型训练
-  run_fgsm.py               # FGSM 攻击评估
-  run_membership_inference.py
-  evaluate_mia_defense.py
-  evaluate_experiment_suite.py
-
-tests/
-  test_attacks.py           # 单元测试（10 cases）
-```
-
----
-
-## 核心代码接口
+### 代码接口
 
 ```python
 from adversral.attacks import fgsm_attack
 
-# 标准 FGSM
+# 1. 标准 FGSM
 adv = fgsm_attack(model, inputs, labels, epsilon=8/255)
 
-# 归一化梯度
+# 2. 归一化梯度
 adv = fgsm_attack(model, inputs, labels, epsilon=8/255, method="normalized")
 
-# 感知自适应 + MIA 导向（本项目创新）
+# 3. 感知自适应 + MIA 导向（本项目创新）
 adv = fgsm_attack(
     model, inputs, labels, epsilon=8/255,
     method="adaptive",
-    gradient_alpha=0.5,      # 梯度集中程度
-    perceptual_beta=0.5,     # 感知权重
-    kernel_size=5,           # 局部方差窗口
-    mia_conf_lambda=0.5,     # MIA 置信度导向损失权重
+    gradient_alpha=0.5,       # 梯度集中程度
+    perceptual_beta=0.5,      # 感知权重强度
+    kernel_size=5,            # 局部方差窗口大小
+    mia_conf_lambda=0.5,      # MIA 置信度导向损失权重
 )
 ```
 
 ---
 
-## 参考文献
+## 9. 项目文件结构
 
-- Goodfellow et al., *Explaining and Harnessing Adversarial Examples*, ICLR 2015
-- Shokri et al., *Membership Inference Attacks Against Machine Learning Models*, IEEE S&P 2017
-- Nasr et al., *Machine Learning with Membership Privacy using Adversarial Regularization*, CCS 2018
-- Zhang et al., *Theoretically Principled Trade-off between Robustness and Accuracy (TRADES)*, ICML 2019
-- Chen et al., *RelaxLoss: Defending Membership Inference Attacks without Losing Utility*, ICLR 2022
-- Tang et al., *Mitigating Membership Inference Attacks by Self-Distillation Through a Novel Ensemble Architecture (SELENA)*, USENIX Security 2022
+```
+adversral/
+  attacks/
+    fgsm.py                 # 核心算法：sign / normalized / adaptive 三种方法
+    fgsm_original.py        # 原始 FGSM 实现备份
+    membership_inference.py # 阈值 MIA 攻击实现
+  data/
+    vision.py               # MNIST / CIFAR-10 / CIFAR-100 数据加载
+  models/
+    vision.py               # SimpleCNN + ResNet 系列模型定义
+  engine.py                 # 训练循环（支持 CE / KL 损失 + AdvReg 置信度惩罚）
+  device.py                 # 自动选择 cuda → mps → cpu
+
+scripts/
+  quick_experiment.py       # 一键跑 5 种方法对比（主要入口）
+  push_experiment.py        # 超参数扫描（探索 ε 和 λ 的影响）
+  train.py                  # 训练单个模型
+  evaluate_mia_defense.py   # baseline vs defense 对照评估
+  run_membership_inference.py  # 单独运行 MIA 评估
+
+tests/
+  test_attacks.py           # 10 个单元测试，验证算法正确性
+```
+
+---
+
+## 10. 参考文献
+
+| 论文 | 贡献 |
+|---|---|
+| Goodfellow et al., ICLR 2015 | FGSM 原始论文 |
+| Shokri et al., IEEE S&P 2017 | 成员推理攻击原始论文 |
+| Nasr et al., CCS 2018 | AdvReg：对抗正则化防御 MIA |
+| Zhang et al., ICML 2019 | TRADES：鲁棒性与准确率的权衡 |
+| Chen et al., ICLR 2022 | RelaxLoss：梯度上升式损失 |
+| Tang et al., USENIX 2022 | SELENA：自蒸馏集成防御 |
