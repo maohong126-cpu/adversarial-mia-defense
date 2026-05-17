@@ -308,6 +308,27 @@ Linear(128 → num_classes)
 
 ---
 
+### ResNet18 × CIFAR-10（大模型实验，train_size=5000，epochs=50）
+
+更大的模型和数据量：ResNet18（~11M 参数）在 5000 个 CIFAR-10 样本上严重过拟合
+（train_acc=98.7%，val_acc=72.2%，gap=26.6%），MIA 基线攻击成功率达 **67.80%**。
+
+| 方法 | Clean Acc | MIA Acc | MIA Drop | Clean Δ | PU Score |
+|---|---|---|---|---|---|
+| Baseline | 0.7217 | **0.6780** | — | — | — |
+| Sign-FGSM（ε=8/255） | 0.5401 | 0.5483 | **+12.97%** ✓10%+ | -18.16% | 0.71 |
+| Normalized-FGSM | 0.6422 | 0.5877 | +9.03% | -7.95% | 1.14 |
+| Adaptive-FGSM（ε=8/255，λ=0.5） | 0.6538 | 0.6177 | +6.03% | -6.79% | 0.89 |
+| **Adaptive+KL+AdvReg**（ε=8/255，λ=0.5，μ=0.3） | **0.6935** | 0.6450 | +3.30% | **-2.82%** | **1.17** |
+
+**关键发现（ResNet18）**：
+- Sign-FGSM 首次突破 **10% MIA 绝对降低**，但代价是 clean acc 暴跌 18.16%（模型几乎不可用）
+- Normalized-FGSM 在大模型上有效（9.03% MIA drop），与 simple_cnn 上无效形成对比——说明归一化梯度方向对复杂模型更适配
+- **Adaptive+KL+AdvReg 仍是最优 PU Score（1.17）**：clean acc 仅损失 2.82%，同时提供 3.3% MIA 保护
+- 大模型（ResNet18）比小模型（SimpleCNN）在相同 ε 下对抗训练冲击更大，需根据模型规模调整 ε
+
+---
+
 ### CIFAR-10 小数据实验（train_size=2000，epochs=40）
 
 | 方法 | Clean Acc | MIA Acc | MIA Drop |
@@ -335,6 +356,18 @@ Linear(128 → num_classes)
 ---
 
 ## 指标说明
+
+### 快速看懂实验表格
+
+```
+MIA Acc = 0.50  → 攻击者随机猜，防御达到理想状态
+MIA Acc = 0.70  → 攻击者 70% 能猜对，模型严重泄露训练数据
+MIA Drop = +5%  → 防御后攻击者少猜对 5 个百分点，正数越大越好
+Clean Δ  = -3%  → 加入防御后模型分类准确率损失 3%，越接近 0 越好
+PU Score = 3.0  → 每损失 1% 分类精度，换来 3% 的 MIA 保护提升，越高越好
+```
+
+---
 
 ### Privacy-Utility Score（PU Score）
 
