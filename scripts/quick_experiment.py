@@ -60,6 +60,7 @@ def make_configs(epsilon: float) -> list[dict]:
             "train_conf_lambda": 0.0,
             "gradient_alpha": 0.5,
             "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.0,
         },
         {
             "name": "2-Sign-FGSM",
@@ -70,6 +71,7 @@ def make_configs(epsilon: float) -> list[dict]:
             "train_conf_lambda": 0.0,
             "gradient_alpha": 0.5,
             "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.0,
         },
         {
             "name": "3-Normalized-FGSM",
@@ -80,26 +82,51 @@ def make_configs(epsilon: float) -> list[dict]:
             "train_conf_lambda": 0.0,
             "gradient_alpha": 0.5,
             "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.0,
         },
         {
             "name": "4-Adaptive-FGSM",
             "epsilon": epsilon,
             "method": "adaptive",
             "adversarial_loss_type": "ce",
-            "mia_conf_lambda": 0.5,   # MIA-steered confidence penalty in generation
+            "mia_conf_lambda": 0.5,
             "train_conf_lambda": 0.0,
             "gradient_alpha": 0.5,
             "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.0,
         },
         {
             "name": "5-Adaptive+KL+AdvReg",
             "epsilon": epsilon,
             "method": "adaptive",
-            "adversarial_loss_type": "kl",   # TRADES-style KL training loss
-            "mia_conf_lambda": 0.5,           # MIA-steered confidence in generation
-            "train_conf_lambda": 0.3,         # AdvReg-inspired: penalise train confidence
+            "adversarial_loss_type": "kl",
+            "mia_conf_lambda": 0.5,
+            "train_conf_lambda": 0.3,
             "gradient_alpha": 0.5,
             "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.0,
+        },
+        {
+            "name": "6-GradSmooth(α=0.3)",
+            "epsilon": 0.0,               # no adversarial examples added
+            "method": "sign",
+            "adversarial_loss_type": "ce",
+            "mia_conf_lambda": 0.0,
+            "train_conf_lambda": 0.0,
+            "gradient_alpha": 0.5,
+            "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.3,     # max label smoothing for high-gradient samples
+        },
+        {
+            "name": "7-GradSmooth(α=0.5)",
+            "epsilon": 0.0,
+            "method": "sign",
+            "adversarial_loss_type": "ce",
+            "mia_conf_lambda": 0.0,
+            "train_conf_lambda": 0.0,
+            "gradient_alpha": 0.5,
+            "perceptual_beta": 0.5,
+            "grad_smooth_alpha": 0.5,
         },
     ]
 
@@ -114,9 +141,11 @@ def train_model(cfg: dict, loaders, criterion, device, epochs: int, lr: float,
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
+    gs_alpha = cfg.get("grad_smooth_alpha", 0.0)
     print(f"\n[{cfg['name']}]  ε={cfg['epsilon']:.4f}  method={cfg['method']}  "
           f"adv_loss={cfg['adversarial_loss_type']}  "
-          f"gen_λ={cfg['mia_conf_lambda']:.2f}  train_λ={cfg['train_conf_lambda']:.2f}")
+          f"gen_λ={cfg['mia_conf_lambda']:.2f}  train_λ={cfg['train_conf_lambda']:.2f}  "
+          f"gs_α={gs_alpha:.2f}")
 
     for epoch in range(1, epochs + 1):
         train_loss, train_acc = train_one_epoch(
@@ -133,6 +162,7 @@ def train_model(cfg: dict, loaders, criterion, device, epochs: int, lr: float,
             adversarial_perceptual_beta=cfg["perceptual_beta"],
             adversarial_mia_conf_lambda=cfg["mia_conf_lambda"],
             train_conf_lambda=cfg["train_conf_lambda"],
+            grad_smooth_alpha=gs_alpha,
         )
         val_loss, val_acc = evaluate(model, loaders.val, criterion, device)
         scheduler.step()
